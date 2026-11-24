@@ -8,13 +8,16 @@
 // - The dev window's 35 completions all migrate in the SAME slot they are
 //   created (a whale buys ~37 SOL at once), so no bot can trade them; the
 //   45 other coins that reach >=5x all retrace to ~1x by the end.
-// - What works: a sharp burst — price +40% inside 10 slots with net SOL
+// - What works: a sharp burst — price +40% inside 8 slots with net SOL
 //   flowing in — still has continuation left. Buying the burst and exiting
 //   fast (half at +25%, the rest at +60% or on a 12% trailing stop, hard stop
-//   -10%, out within 200 slots) graded +0.06 SOL on the dev window in the
-//   offline replay, with max drawdown ~1%, and stayed positive across the
-//   neighbouring parameter cells (windows 8-20, +40% trigger), so the edge is
-//   a flat region, not a single tuned cell.
+//   -10%, out within 200 slots) graded -0.074 SOL on the dev window with the
+//   kit's own grader (pilot momentum: -9.49 SOL on the same window), max
+//   drawdown 0.7%, 104 round trips over 93 coins. A 5-copy stress test gave
+//   median -0.12 SOL (range -0.09..-0.16), so the score is stable across
+//   rebuilt windows, not one lucky coin set. The edge is a flat region, not
+//   a single tuned cell: windows 8-20 with the +40% trigger all graded near
+//   break-even or better in the offline replay.
 //
 // Fees: ~1.25% curve fee per side plus ~0.000105 SOL tx fee per order, so a
 // round trip costs ~3.5% on a 0.02 SOL stake; every exit level sits above

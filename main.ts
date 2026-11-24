@@ -256,7 +256,7 @@ await runBot({
         if (sellPending) continue;
       }
       if (orders.length >= cap) break;
-      const amount = sellAll ? pos.token_amount : BigInt(tokens / 2);
+      const amount = sellAll ? pos.token_amount : BigInt(Math.floor(tokens / 2));
       orders.push({ side: 'sell', mint, token_amount: amount, max_slippage_bps: SELL_SLIP_BPS });
       if (sellHalf) h.stage = 1;
     }

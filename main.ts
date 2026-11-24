@@ -1,20 +1,16 @@
-// Fresh-launch breakout bot for the pump.fun replay (paper, 10 SOL).
+// Second-leg momentum bot for the pump.fun replay (paper, 10 SOL).
 //
-// Idea: most pump.fun coins die flat, but a large minority pump 1.5x-15x within
-// minutes of launch and then retrace. This bot only buys FRESH curves (under
-// ~4 minutes old) while early buy pressure is still accelerating, sizes small,
-// and exits in stages: half at +60%, the rest at +150% or on a trailing stop,
-// with a hard stop at -30% and a time stop. It never pyramids, never chases a
-// coin that already ran far, and never holds a flat coin overnight.
-//
-// Why fresh, not mature: by the time a curve is 500+ slots old the easy move is
-// usually gone; the data's 35 completions all ran 14.7x from creation, and 479
-// of 1222 dev-window coins touched >=1.5x at some point while only 46 ended
-// there — the money is in catching the move early and selling into it, not in
-// holding to the close.
+// v1 lesson (graded locally: -5.81 SOL, 21% win rate, drawdown 58.6%): buying
+// FRESH curves on their first spike loses. A fresh coin's first pump is
+// mostly the launch itself dumping back; 479 of 1222 dev-window coins touched
+// >=1.5x but only 46 ended there. v2 waits for the second leg: a curve that
+// is 100+ slots old, still pulling net SOL in, with the newer half of its
+// tape stronger than the older half, and the price pressing its window high.
+// Winners are then allowed to run: half off at +100%, the rest at +400% or on
+// a 20% trailing stop, so a 14.7x completion pays for many small stops.
 //
 // Fees: ~1.25% curve fee per side plus ~0.000105 SOL tx fee per order, so a
-// round trip costs ~2.7% on a 0.1 SOL stake. Every exit level sits far above
+// round trip costs ~2.7% on a 0.05 SOL stake. Every exit level sits far above
 // that. Guardrails: at least 20 distinct coins with >=0.01 SOL round trips,
 // max drawdown 50%, max 5 open positions.
 //
@@ -35,36 +31,37 @@ const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125; // 95bps protocol + 30bps creator
 const TX_SOL = 0.000105; // base 5000 + priority 100000 lamports, per order
 
-// Entry: fresh breakout window.
-const ENTRY_WINDOW = 40; // slots of tape to judge
-const MAX_AGE = 240; // slots since CreateEvent; older coins are not fresh
-const MIN_BUYS = 3; // buy trades in the window
-const MIN_BUYERS = 3; // distinct buying wallets in the window
-const MIN_NET_SOL = 0.3; // net buy SOL (buys minus sells) in the window
-const STRONG_NET_SOL = 1.5; // net inflow that earns the bigger stake
-const STRONG_BUYERS = 6;
-const MIN_UP = 0.08; // price now vs window-start price, minus 1
-const NEAR_HIGH = 0.95; // price now at least this share of the window high
-const MAX_DOMINANCE = 0.7; // largest single buyer share of window buy SOL
-const MIN_RQ_SOL = 0.5; // real SOL reserve at entry
-const MAX_RQ_SOL = 40;
-const STAKE_SOL = 0.1;
-const STRONG_STAKE_SOL = 0.2;
+// Entry: second-leg momentum over a 60-slot window.
+const ENTRY_WINDOW = 60;
+const MIN_AGE = 100; // slots since CreateEvent; skip the launch dump
+const MAX_AGE = 1500; // stale curves stop moving
+const MIN_BUYS = 5;
+const MIN_BUYERS = 5;
+const MIN_NET_SOL = 1.0; // net buy SOL in the window
+const MIN_UP = 0.12; // price now vs window-start price, minus 1
+const NEAR_HIGH = 0.97; // price now at least this share of the window high
+const ACCEL = 1.2; // newer-half net inflow multiple of the older half's
+const MAX_DOMINANCE = 0.6; // largest single buyer share of window buy SOL
+const MIN_RQ_SOL = 2; // real SOL reserve at entry
+const MAX_RQ_SOL = 60;
+const STAKE_SOL = 0.05; // first buy
+const ADD_SOL = 0.05; // one add into strength
+const ADD_STEP = 0.1; // add only once price is 10% above the last buy
 const MIN_BUY_SOL = 0.01;
-const BUY_SLIP_BPS = 1000;
+const BUY_SLIP_BPS = 1500;
 const SELL_SLIP_BPS = 10_000;
 
 // Exits.
-const TP1 = 1.6; // sell half at +60% of cost
-const TP2 = 2.5; // sell the rest at +150% of cost
-const TRAIL_ARM = 1.3; // trailing stop arms once value hits cost * this
-const TRAIL = 0.25; // sell when value falls this far below its peak
-const STOP_LOSS = 0.7; // sell everything below cost * this
-const MAX_HOLD = 1200; // slots; time stop unless already up
-const HOLD_IF_UP = 1.1;
-const COOLDOWN = 100; // slots after an exit before re-entering a coin
+const TP1 = 2.0; // sell half at +100% of cost
+const TP2 = 5.0; // sell the rest at +400% of cost
+const TRAIL_ARM = 1.5; // trailing stop arms once value hits cost * this
+const TRAIL = 0.2; // sell when value falls this far below its peak ratio
+const STOP_LOSS = 0.8; // sell everything below cost * this
+const MAX_HOLD = 900; // slots; time stop unless already up
+const HOLD_IF_UP = 1.05;
+const COOLDOWN = 150; // slots after an exit before re-entering a coin
 const MAX_ENTRIES = 2;
-const MAX_EXPOSURE_SOL = 1.0; // most SOL at cost across positions at once
+const MAX_EXPOSURE_SOL = 0.75; // most SOL at cost across positions at once
 
 // Pace fallback: keep the 20-coin guardrail safe even if the strict signal
 // goes quiet. Elapsed share is block time since the first batch over 24h.
@@ -99,11 +96,14 @@ interface Held {
   stage: 0 | 1; // 0 = full size, 1 = half already sold at TP1
   filled: boolean;
   fallback: boolean;
+  /** SOL already put into this position (fees included). */
+  invested: number;
+  /** Price when the last buy was decided. */
+  lastAddPrice: number;
 }
 
 const tapes = new Map<Pubkey, Tape>();
 const held = new Map<Pubkey, Held>();
-let myFills = 0;
 const myCoins = new Set<Pubkey>();
 let firstTime: number | null = null;
 let lastTime: number | null = null;
@@ -124,11 +124,25 @@ const priceOf = (vq: number, vt: number): number => (vt > 0 ? vq / vt / LAMPORTS
 const sellValue = (tokens: number, vq: number, vt: number): number =>
   ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - TX_SOL;
 
-/** Fresh-breakout entry signal on a tape at slot `now`. */
-const entrySignal = (t: Tape, now: number, rqSol: number): { ok: boolean; strong: boolean } => {
-  const no = { ok: false, strong: false };
-  if (rqSol < MIN_RQ_SOL || rqSol > MAX_RQ_SOL) return no;
-  if (t.created === null || now - t.created > MAX_AGE) return no;
+/** Net buy SOL over the tape in a slot window, split into older/newer halves. */
+const windowFlow = (t: Tape, now: number, w: number): { net: number; netOld: number; netNew: number } => {
+  const from = now - w;
+  const mid = now - w / 2;
+  let netOld = 0;
+  let netNew = 0;
+  for (const tr of t.trades) {
+    if (tr.slot <= from) continue;
+    const signed = tr.buy ? tr.sol : -tr.sol;
+    if (tr.slot <= mid) netOld += signed;
+    else netNew += signed;
+  }
+  return { net: netOld + netNew, netOld, netNew };
+};
+
+/** Second-leg momentum signal on a tape at slot `now`. */
+const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
+  if (rqSol < MIN_RQ_SOL || rqSol > MAX_RQ_SOL) return false;
+  if (t.created === null || now - t.created < MIN_AGE || now - t.created > MAX_AGE) return false;
   const from = now - ENTRY_WINDOW;
   let buySol = 0;
   let sellSol = 0;
@@ -153,17 +167,19 @@ const entrySignal = (t: Tape, now: number, rqSol: number): { ok: boolean; strong
     if (tr.price > high) high = tr.price;
     last = tr.price;
   }
-  if (buys < MIN_BUYS || byUser.size < MIN_BUYERS) return no;
+  if (buys < MIN_BUYS || byUser.size < MIN_BUYERS) return false;
   const net = buySol - sellSol;
-  if (net < MIN_NET_SOL) return no;
-  if (startPrice <= 0) return no;
+  if (net < MIN_NET_SOL) return false;
+  if (startPrice <= 0) return false;
   const up = last / startPrice - 1;
-  if (up < MIN_UP) return no;
-  if (last < high * NEAR_HIGH) return no;
+  if (up < MIN_UP) return false;
+  if (last < high * NEAR_HIGH) return false;
+  const flow = windowFlow(t, now, ENTRY_WINDOW);
+  if (flow.netNew <= 0 || flow.netNew < ACCEL * flow.netOld) return false;
   let top = 0;
   for (const v of byUser.values()) if (v > top) top = v;
-  if (top > MAX_DOMINANCE * buySol) return no;
-  return { ok: true, strong: net >= STRONG_NET_SOL && byUser.size >= STRONG_BUYERS };
+  if (top > MAX_DOMINANCE * buySol) return false;
+  return true;
 };
 
 await runBot({
@@ -172,7 +188,6 @@ await runBot({
     const traded = new Set<Pubkey>();
     for (const f of batch.fills) {
       if (f.status === 'filled' && !f.client_id.startsWith('_')) {
-        myFills++;
         myCoins.add(f.mint);
       }
     }
@@ -261,7 +276,7 @@ await runBot({
       if (sellHalf) h.stage = 1;
     }
 
-    // Entries: fresh breakout first, pace fallback when the coin count lags.
+    // Entries and one add into strength.
     let free = Number(state.freeCashLamports()) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
     let exposure = 0;
@@ -278,27 +293,38 @@ await runBot({
       if (orders.length >= cap) break;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
-      if (pendingByMint.has(mint) || held.has(mint)) continue;
+      if (pendingByMint.has(mint)) continue;
       const t = tapes.get(mint)!;
-      if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN) continue;
+      const h = held.get(mint);
+      const price = priceOf(Number(curve.virtual_quote_reserves), Number(curve.virtual_token_reserves));
       const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-      const sig = entrySignal(t, now, rqSol);
       let want = 0;
       let fallback = false;
-      if (sig.ok) {
-        want = sig.strong ? STRONG_STAKE_SOL : STAKE_SOL;
-      } else if (behindPace && slotsLeft > 0) {
-        // Pace fallback: any fresh coin with a couple of buys and a usable cap.
-        if (t.created === null || now - t.created > MAX_AGE) continue;
-        let buys = 0;
-        for (const tr of t.trades) if (tr.slot > now - ENTRY_WINDOW && tr.buy) buys++;
-        if (buys < 2) continue;
-        want = FALLBACK_STAKE_SOL;
-        fallback = true;
+      if (h === undefined) {
+        if (slotsLeft <= 0) continue;
+        if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN) continue;
+        if (entrySignal(t, now, rqSol)) {
+          want = STAKE_SOL;
+        } else if (behindPace) {
+          // Pace fallback: any mature coin with a couple of buys and a cap.
+          if (t.created === null || now - t.created < MIN_AGE || now - t.created > MAX_AGE) continue;
+          let buys = 0;
+          for (const tr of t.trades) if (tr.slot > now - ENTRY_WINDOW && tr.buy) buys++;
+          if (buys < 2) continue;
+          want = FALLBACK_STAKE_SOL;
+          fallback = true;
+        } else {
+          continue;
+        }
       } else {
-        continue;
+        // One add into strength: price stepped up from the last buy and the
+        // tape still shows net inflow over the entry window.
+        if (h.fallback || !h.filled || h.invested >= STAKE_SOL + ADD_SOL - MIN_BUY_SOL) continue;
+        if (price < h.lastAddPrice * (1 + ADD_STEP)) continue;
+        if (windowFlow(t, now, ENTRY_WINDOW).net < MIN_NET_SOL) continue;
+        if (rqSol > MAX_RQ_SOL) continue;
+        want = Math.min(ADD_SOL, STAKE_SOL + ADD_SOL - h.invested);
       }
-      if (slotsLeft <= 0) continue;
       const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
       let amount = Math.min(capSol, want, MAX_EXPOSURE_SOL - exposure);
       if (amount > free - tx) amount = free - tx;
@@ -307,9 +333,22 @@ await runBot({
       orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: BUY_SLIP_BPS });
       free -= amount + tx;
       exposure += amount;
-      held.set(mint, { opened: now, peakRatio: 0, stage: 0, filled: false, fallback });
-      t.entries++;
-      slotsLeft--;
+      if (h === undefined) {
+        held.set(mint, {
+          opened: now,
+          peakRatio: 0,
+          stage: 0,
+          filled: false,
+          fallback,
+          invested: amount,
+          lastAddPrice: price,
+        });
+        t.entries++;
+        slotsLeft--;
+      } else {
+        h.invested += amount;
+        h.lastAddPrice = price;
+      }
     }
     return orders;
   },

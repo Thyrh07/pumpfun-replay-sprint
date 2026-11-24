@@ -124,10 +124,10 @@ const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
   let startPrice = -1;
   let last = 0;
   for (const tr of t.trades) {
-    if (tr.slot <= from) {
-      startPrice = tr.price;
-      continue;
-    }
+    // The window start is the first trade INSIDE the window: measuring from
+    // the last trade before it would understate the burst (the pre-burst
+    // price is lower) and fire the signal on weaker moves.
+    if (tr.slot <= from) continue;
     if (startPrice < 0) startPrice = tr.price;
     if (tr.buy) {
       buySol += tr.sol;

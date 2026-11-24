@@ -39,7 +39,7 @@ const CURVE_FEE = 0.0125; // 95bps protocol + 30bps creator
 const TX_SOL = 0.000105; // base 5000 + priority 100000 lamports, per order
 
 // Entry: a sharp burst inside a 10-slot window.
-const ENTRY_WINDOW = 10;
+const ENTRY_WINDOW = 8;
 const MIN_AGE = 20; // slots since CreateEvent; the creation slot itself is untradeable
 const MAX_AGE = 1500; // stale curves stop bursting
 const MIN_BUYS = 2; // buy trades in the window

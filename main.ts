@@ -64,14 +64,10 @@ const COOLDOWN = 100; // slots after an exit before re-entering a coin
 const MAX_ENTRIES = 2;
 const MAX_EXPOSURE_SOL = 0.75; // most SOL at cost across positions at once
 
-// Pace fallback: keep the 20-coin guardrail safe even if the burst signal
-// goes quiet. Elapsed share is block time since the first batch over 24h.
-const PACE_TARGET_COINS = 25;
-const PACE_WINDOW_SECS = 86_400;
-const FALLBACK_STAKE_SOL = 0.01;
-const FALLBACK_TP = 1.3;
-const FALLBACK_STOP = 0.8;
-const FALLBACK_HOLD = 600;
+// No pace fallback: the burst signal alone traded 102 coins on the dev
+// window, far above the 20-coin guardrail, while the fallback's random
+// 0.01 SOL buys cost ~0.14 SOL in the real grade. If the final window goes
+// quiet the bot simply trades less; a forced trade is a losing trade.
 
 interface Trade {
   slot: number;
@@ -96,14 +92,10 @@ interface Held {
   peakRatio: number;
   stage: 0 | 1; // 0 = full size, 1 = half already sold at TP1
   filled: boolean;
-  fallback: boolean;
 }
 
 const tapes = new Map<Pubkey, Tape>();
 const held = new Map<Pubkey, Held>();
-const myCoins = new Set<Pubkey>();
-let firstTime: number | null = null;
-let lastTime: number | null = null;
 
 const tapeOf = (mint: Pubkey): Tape => {
   let t = tapes.get(mint);
@@ -155,16 +147,7 @@ await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     const now = batch.slot;
     const traded = new Set<Pubkey>();
-    for (const f of batch.fills) {
-      if (f.status === 'filled' && !f.client_id.startsWith('_')) {
-        myCoins.add(f.mint);
-      }
-    }
     for (const e of batch.events) {
-      if (e.block_time !== null) {
-        if (firstTime === null) firstTime = e.block_time;
-        if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
-      }
       if (e.event === 'CreateEvent') {
         tapeOf(e.mint).created = e.slot;
       } else if (e.event === 'TradeEvent') {
@@ -220,17 +203,13 @@ await runBot({
       const cost = Number(pos.cost_lamports) / LAMPORTS;
       const ratio = cost > 0 ? value / cost : 0;
       if (ratio > h.peakRatio) h.peakRatio = ratio;
-      const tp1 = h.fallback ? FALLBACK_TP : TP1;
-      const tp2 = h.fallback ? FALLBACK_TP : TP2;
-      const stop = h.fallback ? FALLBACK_STOP : STOP_LOSS;
-      const maxHold = h.fallback ? FALLBACK_HOLD : MAX_HOLD;
       let sellAll = false;
       let sellHalf = false;
-      if (ratio >= tp2) sellAll = true;
-      else if (h.stage === 0 && ratio >= tp1) sellHalf = true;
-      else if (ratio < stop) sellAll = true;
-      else if (!h.fallback && h.peakRatio >= TRAIL_ARM && ratio < h.peakRatio * (1 - TRAIL)) sellAll = true;
-      else if (now - h.opened > maxHold && ratio < HOLD_IF_UP) sellAll = true;
+      if (ratio >= TP2) sellAll = true;
+      else if (h.stage === 0 && ratio >= TP1) sellHalf = true;
+      else if (ratio < STOP_LOSS) sellAll = true;
+      else if (h.peakRatio >= TRAIL_ARM && ratio < h.peakRatio * (1 - TRAIL)) sellAll = true;
+      else if (now - h.opened > MAX_HOLD && ratio < HOLD_IF_UP) sellAll = true;
       if (!sellAll && !sellHalf) continue;
       if (pendingByMint.has(mint)) {
         let sellPending = false;
@@ -245,18 +224,13 @@ await runBot({
       if (sellHalf) h.stage = 1;
     }
 
-    // Entries: burst first, pace fallback when the coin count lags.
+    // Entries: the burst signal only.
     let free = Number(state.freeCashLamports()) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
     let exposure = 0;
     for (const [mint] of held) {
       const pos = state.positions.get(mint);
       exposure += pos ? Number(pos.cost_lamports) / LAMPORTS : 0;
-    }
-    let behindPace = false;
-    if (firstTime !== null && lastTime !== null) {
-      const pace = Math.min(1, (lastTime - firstTime) / PACE_WINDOW_SECS);
-      behindPace = myCoins.size < Math.ceil(PACE_TARGET_COINS * pace);
     }
     for (const mint of traded) {
       if (orders.length >= cap) break;
@@ -266,31 +240,17 @@ await runBot({
       const t = tapes.get(mint)!;
       if (t.entries >= MAX_ENTRIES || now - t.lastExit < COOLDOWN) continue;
       const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-      let want = 0;
-      let fallback = false;
-      if (entrySignal(t, now, rqSol)) {
-        want = STAKE_SOL;
-      } else if (behindPace && slotsLeft > 0) {
-        // Pace fallback: any mature coin with a couple of buys and a cap.
-        if (t.created === null || now - t.created < MIN_AGE || now - t.created > MAX_AGE) continue;
-        let buys = 0;
-        for (const tr of t.trades) if (tr.slot > now - ENTRY_WINDOW && tr.buy) buys++;
-        if (buys < 2) continue;
-        want = FALLBACK_STAKE_SOL;
-        fallback = true;
-      } else {
-        continue;
-      }
+      if (!entrySignal(t, now, rqSol)) continue;
       if (slotsLeft <= 0) continue;
       const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
-      let amount = Math.min(capSol, want, MAX_EXPOSURE_SOL - exposure);
+      let amount = Math.min(capSol, STAKE_SOL, MAX_EXPOSURE_SOL - exposure);
       if (amount > free - tx) amount = free - tx;
       if (amount < MIN_BUY_SOL) continue;
       const lamports = BigInt(Math.floor(amount * LAMPORTS));
       orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: BUY_SLIP_BPS });
       free -= amount + tx;
       exposure += amount;
-      held.set(mint, { opened: now, peakRatio: 0, stage: 0, filled: false, fallback });
+      held.set(mint, { opened: now, peakRatio: 0, stage: 0, filled: false });
       t.entries++;
       slotsLeft--;
     }
